@@ -1,0 +1,139 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+
+  security:
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+
+      # 1. Checkout
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+
+      # 2. Prepare reports directory
+      - name: Create reports directory
+        run: mkdir -p reports
+
+
+      # 3. SAST - Semgrep
+      - name: SAST - Semgrep
+        run: |
+          python -m pip install semgrep
+          semgrep scan \
+            --config=p/javascript \
+            --config=p/owasp-top-ten \
+            --sarif \
+            --output=reports/semgrep.sarif \
+            . || true
+
+
+      # 4. SCA / filesystem scan - Trivy
+      - name: SCA - Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          format: sarif
+          output: reports/trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: '0'
+
+
+      # 5. IaC scan
+      - name: IaC Security - Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          format: sarif
+          output: reports/trivy-iac.sarif
+          exit-code: '0'
+
+
+      # 6. Upload reports to GitHub
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: reports/
+
+
+      # 7. Send reports to DefectDojo
+      - name: Import results into DefectDojo
+        run: |
+
+          for file in reports/*.sarif
+          do
+
+            if [ -f "$file" ]; then
+
+              echo "Importing $file"
+
+              curl -sS -X POST \
+                "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
+                -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_KEY }}" \
+                -F "scan_type=SARIF" \
+                -F "file=@$file" \
+                -F "engagement=${{ secrets.DEFECTDOJO_ENGAGEMENT }}" \
+                -F "active=true" \
+                -F "verified=false" \
+                -F "close_old_findings=true" \
+                -F "deduplication_on_engagement=true"
+
+            fi
+
+          done
+
+
+      # 8. Quality Gate
+      - name: Quality Gate
+        run: |
+
+          python3 << 'PYEOF'
+
+          import json
+          import glob
+          import sys
+
+          critical = 0
+
+          for filename in glob.glob("reports/*.sarif"):
+
+              try:
+
+                  with open(filename) as f:
+                      data = json.load(f)
+
+                  for run in data.get("runs", []):
+
+                      for result in run.get("results", []):
+
+                          if result.get("level") == "error":
+                              critical += 1
+
+              except Exception as e:
+                  print(f"Could not read {filename}: {e}")
+
+          print(f"Security findings detected: {critical}")
+
+          if critical > 0:
+
+              print("❌ QUALITY GATE FAILED")
+              sys.exit(1)
+
+          print("✅ QUALITY GATE PASSED")
+
+          PYEOF
